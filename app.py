@@ -78,18 +78,25 @@ if "weak_practice_q" not in st.session_state:
 # ==========================
 
 def get_data(worksheet_name):
-    """從 Google Sheet 讀取資料，忽略 200 假警報"""
+    """強壯版讀取：去除欄位空白 + 顯示除錯資訊"""
     try:
         df = conn.read(worksheet=worksheet_name, ttl=0)
-        # 如果讀出來是 None，回傳空 DataFrame
-        if df is None:
+        
+        # 1. 處理空資料
+        if df is None or df.empty:
             return pd.DataFrame()
+
+        # 2. 自動清除欄位名稱的前後空白 (關鍵修正！)
+        df.columns = df.columns.str.strip()
+        
+        # 3. 檢查關鍵欄位是否存在 (Debug用)
+        if worksheet_name == "questions" and "option_A" not in df.columns:
+            st.toast(f"⚠️ 警告：找不到 option_A 欄位。目前的欄位是：{list(df.columns)}")
+            
         return df
     except Exception as e:
-        # 如果錯誤訊息包含 200，代表其實是成功的 (空表狀況)
         if "<Response [200]>" in str(e):
             return pd.DataFrame()
-        
         st.error(f"讀取資料庫失敗 ({worksheet_name}): {e}")
         return pd.DataFrame()
 
