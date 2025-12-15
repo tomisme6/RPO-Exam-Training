@@ -3,51 +3,66 @@ import pandas as pd
 import pdfplumber
 import re
 import gspread
+import hashlib, hmac
+from datetime import datetime, timezone, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # =========================================================
-# 頁面設定
+# 基本設定
 # =========================================================
 st.set_page_config(page_title="質子中心-輻防師特訓平台 (雲端版)", layout="wide", page_icon="☢️")
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
-SHEET_NAME = "Pro_Database"  # 你的 Google Sheet 檔名（不是分頁名）
+SHEET_NAME = "Pro_Database"  # Google Sheet 檔名（不是分頁名）
+
+EXPECTED_Q_COLS = [
+    "question", "option_A", "option_B", "option_C", "option_D",
+    "correct_answer", "explanation", "topic", "type"
+]
+USER_COLS = ["username", "password_hash", "role", "created_at", "enabled"]
+RESULT_COLS = ["ts", "username", "mode", "score", "total", "percent", "wrong_count"]
+
+DEFAULT_HEADERS = {
+    "Questions": EXPECTED_Q_COLS,
+    "Mistakes": EXPECTED_Q_COLS,
+    "Users": USER_COLS,
+    "Results": RESULT_COLS,
+}
 
 # =========================================================
 # Google Sheets 連線
 # =========================================================
 @st.cache_resource
 def init_connection():
-    """建立 Google Sheets 連線（從 Streamlit Secrets 讀取 service account 金鑰）"""
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-
     if "gcp_service_account" not in st.secrets:
         st.error("⚠️ 未偵測到 Secrets 設定！請在 Streamlit Cloud 後台設定 [gcp_service_account]。")
         return None
 
     creds_dict = st.secrets["gcp_service_account"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    return client
+    return gspread.authorize(creds)
 
 
-def get_or_create_worksheet(sh, name, rows=1000, cols=10):
+def get_or_create_worksheet(sh, name, rows=2000, cols=30):
     """
     強化版：避免 Streamlit rerun / 多 session 併發時重複建立同名 sheet。
-    就算 add_worksheet 回 400 already exists，也能安全拿回現有的 worksheet。
+    就算 add_worksheet 回 400 already exists，也能安全拿回現有 worksheet。
+    若是新建，會自動寫入對應的 header。
     """
     name = str(name).strip()
 
-    # 1) 先直接拿（最快）
+    # 1) 先直接拿
     try:
         return sh.worksheet(name)
     except WorksheetNotFound:
         pass
 
-    # 2) 再掃一次（有時候 API list 比 worksheet() 穩）
+    # 2) 再掃一次
     try:
         for ws in sh.worksheets():
             if ws.title.strip() == name:
@@ -55,7 +70,7 @@ def get_or_create_worksheet(sh, name, rows=1000, cols=10):
     except Exception:
         pass
 
-    # 3) 嘗試建立；若撞名（already exists）就回頭拿現成的
+    # 3) 建立（撞名就回頭拿現成）
     try:
         ws = sh.add_worksheet(title=name, rows=rows, cols=cols)
     except APIError as e:
@@ -64,54 +79,73 @@ def get_or_create_worksheet(sh, name, rows=1000, cols=10):
             return sh.worksheet(name)
         raise
 
-    # 4) 初始化標題（新建時才做）
-    headers = [
-        "question", "option_A", "option_B", "option_C", "option_D",
-        "correct_answer", "explanation", "topic", "type"
-    ]
-    ws.append_row(headers)
+    # 4) 新建才寫 header
+    headers = DEFAULT_HEADERS.get(name)
+    if headers:
+        ws.append_row(headers)
     return ws
 
 
 # =========================================================
-# 資料讀寫
+# Auth（簡單帳號密碼 / 成績紀錄）
 # =========================================================
-def load_data(worksheet_name):
-    """從 Google Sheet 分頁讀取資料轉為 DataFrame"""
+def _get_auth_pepper():
+    # 建議在 secrets 加：auth_pepper = "一串很亂很長的字串"
+    return st.secrets.get("auth_pepper", "CHANGE_ME_PLEASE")
+
+def hash_password(password: str, salt: str) -> str:
+    pepper = _get_auth_pepper().encode("utf-8")
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        (password.strip().encode("utf-8") + pepper),
+        salt.encode("utf-8"),
+        120_000,
+    )
+    return dk.hex()
+
+def verify_password(password: str, salt: str, stored_hash: str) -> bool:
+    return hmac.compare_digest(hash_password(password, salt), str(stored_hash))
+
+# =========================================================
+# 資料讀寫（Questions/Mistakes/Users/Results）
+# =========================================================
+def load_data(worksheet_name: str) -> pd.DataFrame:
+    """通用讀取：保證回傳 DataFrame，且必要欄位會補齊"""
+    expected = DEFAULT_HEADERS.get(worksheet_name, None)
+
     try:
         client = init_connection()
         if not client:
-            return pd.DataFrame(columns=[
-                "question", "option_A", "option_B", "option_C", "option_D",
-                "correct_answer", "explanation", "topic", "type"
-            ])
+            return pd.DataFrame(columns=expected or [])
 
         sh = client.open(SHEET_NAME)
         ws = get_or_create_worksheet(sh, worksheet_name)
 
         data = ws.get_all_records()
+        if not data:
+            return pd.DataFrame(columns=expected or [])
+
         df = pd.DataFrame(data)
 
-        if df.empty:
-            return pd.DataFrame(columns=[
-                "question", "option_A", "option_B", "option_C", "option_D",
-                "correct_answer", "explanation", "topic", "type"
-            ])
+        # 補欄位
+        if expected:
+            for c in expected:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[expected]
+
         return df
 
     except Exception as e:
         st.error(
-            "連線錯誤：請確認 Secrets 設定正確且已共用權限給 Service Account。\n"
-            f"詳細錯誤: {e}"
+            "連線/資料錯誤（可能是欄位被刪、或資料表空白）\n"
+            f"詳細錯誤: {repr(e)}"
         )
-        return pd.DataFrame(columns=[
-            "question", "option_A", "option_B", "option_C", "option_D",
-            "correct_answer", "explanation", "topic", "type"
-        ])
+        return pd.DataFrame(columns=expected or [])
 
 
-def save_to_google(worksheet_name, new_df: pd.DataFrame):
-    """將 DataFrame 覆蓋寫入 Google Sheet 分頁"""
+def save_to_google(worksheet_name: str, new_df: pd.DataFrame):
+    """覆蓋寫入（適用 Questions / Mistakes / Users），Results 請用 append_result"""
     try:
         client = init_connection()
         if not client:
@@ -121,46 +155,75 @@ def save_to_google(worksheet_name, new_df: pd.DataFrame):
         sh = client.open(SHEET_NAME)
         ws = get_or_create_worksheet(sh, worksheet_name)
 
+        expected = DEFAULT_HEADERS.get(worksheet_name)
+        if expected:
+            for c in expected:
+                if c not in new_df.columns:
+                    new_df[c] = ""
+            new_df = new_df[expected]
+
         ws.clear()
         if new_df is None or new_df.empty:
-            # 至少保留標題列
-            ws.update([[
-                "question", "option_A", "option_B", "option_C", "option_D",
-                "correct_answer", "explanation", "topic", "type"
-            ]])
+            ws.update([expected or []])
             return
 
         ws.update([new_df.columns.values.tolist()] + new_df.values.tolist())
 
     except Exception as e:
-        st.error(f"寫入失敗: {e}")
+        st.error(f"寫入失敗: {repr(e)}")
+
+
+def append_result(row: dict):
+    """追加寫入 Results（不要 clear，不然大家成績會互相洗掉）"""
+    try:
+        client = init_connection()
+        if not client:
+            st.error("❌ 無法建立 Google Sheets 連線")
+            return
+
+        sh = client.open(SHEET_NAME)
+        ws = get_or_create_worksheet(sh, "Results", rows=8000, cols=20)
+
+        # 若表是空的（沒 header），補 header
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(RESULT_COLS)
+
+        ws.append_row([row.get(c, "") for c in RESULT_COLS])
+
+    except Exception as e:
+        st.error(f"成績寫入失敗: {repr(e)}")
+
+
+def load_users() -> pd.DataFrame:
+    df = load_data("Users")
+    for c in USER_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    # enabled 預設 true
+    if "enabled" in df.columns:
+        df["enabled"] = df["enabled"].astype(str).replace({"": "TRUE"})
+    return df[USER_COLS]
+
+
+def save_users(df: pd.DataFrame):
+    for c in USER_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    save_to_google("Users", df[USER_COLS])
+
+
+def load_results() -> pd.DataFrame:
+    df = load_data("Results")
+    for c in RESULT_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[RESULT_COLS]
 
 
 # =========================================================
-# Session State 初始化
+# 題目工具
 # =========================================================
-if "quiz_data" not in st.session_state:
-    st.session_state.quiz_data = None
-if "quiz_submitted" not in st.session_state:
-    st.session_state.quiz_submitted = False
-if "current_single_q" not in st.session_state:
-    st.session_state.current_single_q = None
-if "single_q_revealed" not in st.session_state:
-    st.session_state.single_q_revealed = False
-
-
-# =========================================================
-# 工具函式
-# =========================================================
-def normalize_answer(ans):
-    if pd.isna(ans):
-        return ""
-    ans = str(ans).strip().upper()
-    ans = ans.replace("(", "").replace(")", "").replace("（", "").replace("）", "")
-    mapping = {"1": "A", "2": "B", "3": "C", "4": "D", "A": "A", "B": "B", "C": "C", "D": "D"}
-    return mapping.get(ans, ans)
-
-
 def extract_answer_key(text):
     if pd.isna(text):
         return ""
@@ -175,10 +238,11 @@ def extract_answer_key(text):
 
 def parse_exam_pdf(text):
     """
-    v7.2 修正版：
+    v7.2+：
     - 支援 [解:] / [解：] / [解]
-    - 選項行不再只吃行首，改成「一行內所有 (1)(2)(3)(4) 全部拆開」
-    - 選項跨行：若上一行是選項，下一行沒有新 (n) 記號就接到上一個選項後面
+    - 選項記號可在行中，會完整拆 (1)(2)(3)(4)
+    - 選項跨行：沒有新 (n) 記號就接到上一個選項
+    - 題型辨識：少於 3 個選項 => essay（避免把(1)(2)子題當選擇）
     - 忽略頁尾：第X頁/共Y頁
     """
     questions = []
@@ -186,7 +250,7 @@ def parse_exam_pdf(text):
 
     current_q = None
     state = "SEARCH_Q"
-    last_opt = None  # option_A/B/C/D
+    last_opt = None
 
     def is_footer(s: str) -> bool:
         return bool(re.match(r"^第\s*\d+\s*頁/共\s*\d+\s*頁", s.strip()))
@@ -195,16 +259,11 @@ def parse_exam_pdf(text):
         return bool(re.search(r"\[解(?:[:：])?\]", s))
 
     def split_options_anywhere(s: str):
-        """
-        把一行內所有選項拆開：
-        支援 (1) 或 （1）
-        回傳 dict: {"1": "(1)....", "2": "(2)....", ...}
-        """
+        # 支援 (1) 或 （1）
         pat = r"[（(]([1-4])[）)]"
         hits = list(re.finditer(pat, s))
         if not hits:
             return {}
-
         out = {}
         for i, m in enumerate(hits):
             n = m.group(1)
@@ -214,15 +273,42 @@ def parse_exam_pdf(text):
             out[n] = chunk
         return out
 
+    def finalize_question(q: dict) -> dict:
+        opts = [
+            str(q.get("option_A", "")).strip(),
+            str(q.get("option_B", "")).strip(),
+            str(q.get("option_C", "")).strip(),
+            str(q.get("option_D", "")).strip(),
+        ]
+        non_empty = [o for o in opts if o]
+
+        # 少於 3 個選項：視為非選擇題（(1)(2)子題很常見）
+        if len(non_empty) < 3:
+            q["type"] = "essay"
+            # 把可能被誤塞進選項的內容搬到 explanation（不要丟資料）
+            extra = []
+            if q.get("option_A"): extra.append(q["option_A"])
+            if q.get("option_B"): extra.append(q["option_B"])
+            if q.get("option_C"): extra.append(q["option_C"])
+            if q.get("option_D"): extra.append(q["option_D"])
+            if extra and not q.get("explanation"):
+                q["explanation"] = "\n".join(extra)
+
+            q["option_A"] = q["option_B"] = q["option_C"] = q["option_D"] = ""
+            q["correct_answer"] = ""
+        else:
+            q["type"] = "choice"
+        return q
+
     for raw in lines:
         line = raw.strip()
         if not line or is_footer(line):
             continue
 
-        # 新題目
+        # 新題目（題號 1. / 1 ）
         if re.match(r"^\d+[\.\s]", line):
             if current_q and "question" in current_q:
-                questions.append(current_q)
+                questions.append(finalize_question(current_q))
 
             current_q = {
                 "question": line,
@@ -256,7 +342,7 @@ def parse_exam_pdf(text):
             last_opt = None
             continue
 
-        # 等待答案那一行（通常是 (3)）
+        # 等待答案那行（通常只有 (3)）
         if state == "WAITING_FOR_ANS":
             ans = extract_answer_key(line)
             if ans and not current_q.get("correct_answer"):
@@ -265,16 +351,15 @@ def parse_exam_pdf(text):
             state = "READING_EXPL"
             continue
 
-        # 讀題幹（直到遇到選項）
+        # 讀題幹：直到遇到任何 (1)-(4)
         if state == "READING_Q":
-            # 只要一行出現任何 (1)-(4)，就視為進入選項
             if split_options_anywhere(line):
                 state = "READING_OPT"
             else:
                 current_q["question"] += " " + line
                 continue
 
-        # 讀選項（核心修正：不管記號在不在行首，都拆）
+        # 讀選項：一行內可同時有多個 (n)
         if state == "READING_OPT":
             opts = split_options_anywhere(line)
             if opts:
@@ -292,12 +377,12 @@ def parse_exam_pdf(text):
                     last_opt = "option_D"
                 continue
 
-            # 沒有新選項記號 → 當作上一個選項的續行
+            # 沒有新選項記號 -> 接到上一個選項
             if last_opt:
                 current_q[last_opt] = (current_q[last_opt] + " " + line).strip()
                 continue
 
-        # 讀解析
+        # 解析內容
         if state == "READING_EXPL":
             if not current_q.get("correct_answer"):
                 ans = extract_answer_key(line)
@@ -306,34 +391,198 @@ def parse_exam_pdf(text):
             current_q["explanation"] += line + "\n"
 
     if current_q and "question" in current_q:
-        questions.append(current_q)
+        questions.append(finalize_question(current_q))
 
     return questions
 
 
+# =========================================================
+# Session State 初始化
+# =========================================================
+if "quiz_data" not in st.session_state:
+    st.session_state.quiz_data = None
+if "quiz_submitted" not in st.session_state:
+    st.session_state.quiz_submitted = False
+if "current_single_q" not in st.session_state:
+    st.session_state.current_single_q = None
+if "single_q_revealed" not in st.session_state:
+    st.session_state.single_q_revealed = False
+if "user" not in st.session_state:
+    st.session_state.user = None
 
 
 # =========================================================
-# Sidebar
+# Sidebar：登入/註冊 + 模式
 # =========================================================
 with st.sidebar:
     st.title("☁️ 雲端功能選單")
-    mode = st.radio(
-        "模式",
-        [
-            "📝 模擬考模式",
-            "📕 錯題本 (雲端同步)",
-            "⚡ 單題即時練習",
-            "📂 匯入 PDF (上傳雲端)",
-            "debug 雲端資料檢查",
-        ],
-    )
+
+    # 未登入：登入/註冊
+    if st.session_state.user is None:
+        tab1, tab2 = st.tabs(["登入", "註冊"])
+
+        with tab1:
+            u = st.text_input("帳號", key="login_u")
+            p = st.text_input("密碼", type="password", key="login_p")
+            if st.button("🔐 登入"):
+                users = load_users()
+                hit = users[(users["username"].astype(str).str.strip() == u.strip())]
+                if hit.empty:
+                    st.error("帳號不存在")
+                else:
+                    row = hit.iloc[0]
+                    enabled = str(row.get("enabled", "TRUE")).upper() != "FALSE"
+                    if not enabled:
+                        st.error("此帳號已停用")
+                    else:
+                        if verify_password(p, u.strip(), row["password_hash"]):
+                            st.session_state.user = {"username": u.strip(), "role": row.get("role", "user") or "user"}
+                            st.success("登入成功")
+                            st.rerun()
+                        else:
+                            st.error("密碼錯誤")
+
+        with tab2:
+            u2 = st.text_input("新帳號", key="reg_u")
+            p2 = st.text_input("新密碼", type="password", key="reg_p")
+            p3 = st.text_input("再輸入一次新密碼", type="password", key="reg_p2")
+
+            if st.button("🆕 建立帳號"):
+                u2 = u2.strip()
+                if not u2:
+                    st.error("帳號不能空白")
+                elif len(u2) < 3:
+                    st.error("帳號至少 3 個字")
+                elif p2 != p3:
+                    st.error("兩次密碼不一致")
+                elif len(p2) < 6:
+                    st.error("密碼至少 6 個字")
+                else:
+                    users = load_users()
+                    if (users["username"].astype(str).str.strip() == u2).any():
+                        st.error("此帳號已存在")
+                    else:
+                        created = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+                        # 第一個帳號自動 admin（省事）
+                        role = "admin" if users[users["username"].astype(str).str.strip() != ""].empty else "user"
+                        new_row = {
+                            "username": u2,
+                            "password_hash": hash_password(p2, u2),
+                            "role": role,
+                            "created_at": created,
+                            "enabled": "TRUE",
+                        }
+                        users = pd.concat([users, pd.DataFrame([new_row])], ignore_index=True)
+                        save_users(users)
+                        st.success(f"建立成功（角色：{role}）")
+                        st.info("回到登入頁登入即可")
+
+        st.stop()
+
+    # 已登入
+    st.success(f"✅ 已登入：{st.session_state.user['username']} ({st.session_state.user['role']})")
+    if st.button("🚪 登出"):
+        st.session_state.user = None
+        st.session_state.quiz_data = None
+        st.session_state.quiz_submitted = False
+        st.session_state.current_single_q = None
+        st.session_state.single_q_revealed = False
+        st.rerun()
+
+    modes = [
+        "📝 模擬考模式",
+        "📕 錯題本 (雲端同步)",
+        "⚡ 單題即時練習",
+        "📂 匯入 PDF (上傳雲端)",
+        "debug 雲端資料檢查",
+    ]
+    if st.session_state.user["role"] == "admin":
+        modes.insert(0, "📊 管理者後台（成績）")
+        modes.insert(1, "👤 管理者後台（帳號）")
+
+    mode = st.radio("模式", modes)
     st.markdown("---")
 
-    if "gcp_service_account" in st.secrets:
-        st.success("✅ Secrets 金鑰已偵測")
-    else:
-        st.error("⚠️ 未偵測到 Secrets！")
+
+# =========================================================
+# 管理者後台：成績
+# =========================================================
+if mode == "📊 管理者後台（成績）":
+    if st.session_state.user["role"] != "admin":
+        st.error("你不是管理者 😼")
+        st.stop()
+
+    st.title("📊 管理者後台：成績總覽")
+    res = load_results()
+
+    if res.empty:
+        st.info("目前沒有任何測驗紀錄")
+        st.stop()
+
+    # 基本清理
+    res["percent_num"] = pd.to_numeric(res["percent"], errors="coerce")
+    res["score_num"] = pd.to_numeric(res["score"], errors="coerce")
+    res["total_num"] = pd.to_numeric(res["total"], errors="coerce")
+
+    users = sorted([u for u in res["username"].astype(str).unique() if u.strip() != ""])
+    pick = st.multiselect("篩選使用者", users, default=users)
+
+    view = res[res["username"].astype(str).isin(pick)].copy()
+    st.dataframe(view.drop(columns=["percent_num", "score_num", "total_num"], errors="ignore"), use_container_width=True)
+
+    st.subheader("📌 使用者平均分數（%）")
+    agg = (
+        view.groupby("username")["percent_num"]
+        .mean()
+        .reset_index()
+        .sort_values("percent_num", ascending=False)
+    )
+    st.dataframe(agg, use_container_width=True)
+    st.stop()
+
+
+# =========================================================
+# 管理者後台：帳號（停用/啟用）
+# =========================================================
+if mode == "👤 管理者後台（帳號）":
+    if st.session_state.user["role"] != "admin":
+        st.error("你不是管理者 😼")
+        st.stop()
+
+    st.title("👤 管理者後台：帳號管理")
+    users = load_users()
+
+    if users.empty:
+        st.info("目前沒有使用者（通常不會發生）")
+        st.stop()
+
+    st.dataframe(users, use_container_width=True)
+
+    st.subheader("停用/啟用帳號")
+    all_users = [u for u in users["username"].astype(str).tolist() if u.strip() != ""]
+    target = st.selectbox("選擇帳號", all_users)
+
+    cur = users[users["username"].astype(str) == str(target)]
+    cur_enabled = True
+    if not cur.empty:
+        cur_enabled = str(cur.iloc[0].get("enabled", "TRUE")).upper() != "FALSE"
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("❌ 停用", disabled=(not cur_enabled) or (target == st.session_state.user["username"])):
+            users.loc[users["username"].astype(str) == str(target), "enabled"] = "FALSE"
+            save_users(users)
+            st.success("已停用")
+            st.rerun()
+    with col2:
+        if st.button("✅ 啟用", disabled=cur_enabled):
+            users.loc[users["username"].astype(str) == str(target), "enabled"] = "TRUE"
+            save_users(users)
+            st.success("已啟用")
+            st.rerun()
+
+    st.caption("⚠️ 不能停用自己（避免你把自己鎖在門外）")
+    st.stop()
 
 
 # =========================================================
@@ -343,15 +592,30 @@ if mode == "📝 模擬考模式":
     st.title("📝 雲端題庫模擬考")
     df = load_data("Questions")
 
+    # 只抓 choice 題 + 選項至少三個 + 有答案
     if not df.empty:
-        valid_df = df[df["question"].notna() & df["correct_answer"].notna()]
-        choice_df = valid_df[valid_df["option_A"].notna() & (valid_df["option_A"] != "")]
+        df["type"] = df["type"].astype(str).replace({"": "choice"})
+        df["correct_answer"] = df["correct_answer"].astype(str)
+
+        valid_df = df[df["question"].notna() & (df["question"].astype(str).str.strip() != "")]
+        choice_df = valid_df[valid_df["type"].astype(str).str.lower().eq("choice")].copy()
+
+        # 選項至少三個不空
+        def opt_count(r):
+            opts = [str(r.get("option_A","")).strip(), str(r.get("option_B","")).strip(),
+                    str(r.get("option_C","")).strip(), str(r.get("option_D","")).strip()]
+            return sum(1 for o in opts if o and o.lower() != "nan")
+
+        if not choice_df.empty:
+            choice_df["opt_cnt"] = choice_df.apply(opt_count, axis=1)
+            choice_df = choice_df[(choice_df["opt_cnt"] >= 3) & (choice_df["correct_answer"].astype(str).str.strip() != "")]
+            choice_df.drop(columns=["opt_cnt"], inplace=True, errors="ignore")
 
         if len(choice_df) == 0:
-            st.warning("雲端題庫是空的，請先匯入 PDF。")
+            st.warning("雲端題庫沒有可用的選擇題（請先匯入 PDF 或檢查解析結果）。")
         else:
             if st.session_state.quiz_data is None:
-                st.info(f"雲端題庫共有 {len(choice_df)} 題。")
+                st.info(f"雲端可用選擇題：{len(choice_df)} 題。")
                 num = st.number_input("題數", 1, len(choice_df), min(20, len(choice_df)))
                 if st.button("🚀 開始測驗", type="primary"):
                     st.session_state.quiz_data = choice_df.sample(n=num).reset_index(drop=True)
@@ -369,14 +633,14 @@ if mode == "📝 模擬考模式":
                             str(row.get("option_C", "")),
                             str(row.get("option_D", "")),
                         ]
-                        clean_labels = [l.replace("nan", "") for l in opt_labels]
+                        clean_labels = [l.replace("nan", "").strip() for l in opt_labels]
 
                         user_answers[index] = st.radio(
-                            f"A{index}",
+                            f"q_{index}",
                             opts,
                             key=f"q_{index}",
                             label_visibility="collapsed",
-                            format_func=lambda x: clean_labels[opts.index(x)],
+                            format_func=lambda x: clean_labels[opts.index(x)] if clean_labels[opts.index(x)] else f"{x}（空）"
                         )
                         st.markdown("---")
 
@@ -386,6 +650,7 @@ if mode == "📝 模擬考模式":
                 if st.session_state.quiz_submitted:
                     score = 0
                     wrong_entries = []
+                    total = len(st.session_state.quiz_data)
 
                     for index, row in st.session_state.quiz_data.iterrows():
                         user = user_answers.get(index)
@@ -414,6 +679,7 @@ if mode == "📝 模擬考模式":
                                 st.error(f"答錯！正確：{correct_text}")
                             st.write(f"解析：{row.get('explanation', '')}")
 
+                    # 同步錯題
                     if wrong_entries:
                         wrong_df = pd.DataFrame(wrong_entries)
                         old_mistakes = load_data("Mistakes")
@@ -422,11 +688,27 @@ if mode == "📝 模擬考模式":
                         save_to_google("Mistakes", final_mistakes)
                         st.toast(f"已同步 {len(wrong_entries)} 題到雲端錯題本！", icon="☁️")
 
-                    st.metric("成績", f"{int(score/len(st.session_state.quiz_data)*100)} 分")
+                    percent = int(score / total * 100) if total else 0
+                    st.metric("成績", f"{percent} 分")
+
+                    # 寫入 Results
+                    append_result({
+                        "ts": datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S"),
+                        "username": st.session_state.user["username"],
+                        "mode": "mock_exam",
+                        "score": score,
+                        "total": total,
+                        "percent": percent,
+                        "wrong_count": total - score,
+                    })
+
                     if st.button("🔄 重測"):
                         st.session_state.quiz_data = None
                         st.session_state.quiz_submitted = False
                         st.rerun()
+    else:
+        st.warning("題庫目前是空的，請先匯入 PDF。")
+
 
 # =========================================================
 # 功能 2: 錯題本
@@ -438,6 +720,10 @@ elif mode == "📕 錯題本 (雲端同步)":
     if mistake_df.empty:
         st.success("☁️ 雲端錯題本是空的！")
     else:
+        # 只練 choice 題
+        mistake_df["type"] = mistake_df["type"].astype(str).replace({"": "choice"})
+        mistake_df = mistake_df[mistake_df["type"].astype(str).str.lower().eq("choice")]
+
         st.write(f"目前雲端累積：{len(mistake_df)} 題")
         if st.button("🎲 抽題練習"):
             st.session_state.current_single_q = mistake_df.sample(1).iloc[0]
@@ -453,13 +739,13 @@ elif mode == "📕 錯題本 (雲端同步)":
                 str(q.get("option_C", "")),
                 str(q.get("option_D", "")),
             ]
-            clean_labels = [l.replace("nan", "") for l in opt_labels]
+            clean_labels = [l.replace("nan", "").strip() for l in opt_labels]
 
             user_ans = st.radio(
                 "選",
                 opts,
                 label_visibility="collapsed",
-                format_func=lambda x: clean_labels[opts.index(x)],
+                format_func=lambda x: clean_labels[opts.index(x)] if clean_labels[opts.index(x)] else f"{x}（空）",
             )
 
             c1, c2 = st.columns(2)
@@ -488,62 +774,68 @@ elif mode == "📕 錯題本 (雲端同步)":
 
                 st.info(f"解析：{q.get('explanation','')}")
 
+
 # =========================================================
-# 功能 3: 單題練習
+# 功能 3: 單題即時練習
 # =========================================================
 elif mode == "⚡ 單題即時練習":
     st.title("⚡ 雲端單題刷")
     df = load_data("Questions")
-    choice_df = df[df["option_A"].notna() & (df["option_A"] != "")]
-
-    if not choice_df.empty:
-        if st.button("🎲 抽題"):
-            st.session_state.current_single_q = choice_df.sample(1).iloc[0]
-            st.session_state.single_q_revealed = False
-
-        q = st.session_state.current_single_q
-        if q is not None:
-            st.markdown(f"### {q['question']}")
-            opts = ["A", "B", "C", "D"]
-            opt_labels = [
-                str(q.get("option_A", "")),
-                str(q.get("option_B", "")),
-                str(q.get("option_C", "")),
-                str(q.get("option_D", "")),
-            ]
-            clean_labels = [l.replace("nan", "") for l in opt_labels]
-
-            user_ans = st.radio(
-                "選",
-                opts,
-                label_visibility="collapsed",
-                format_func=lambda x: clean_labels[opts.index(x)],
-            )
-
-            if st.button("看答案"):
-                st.session_state.single_q_revealed = True
-
-            if st.session_state.single_q_revealed:
-                ans = extract_answer_key(q.get("correct_answer", ""))
-                if user_ans == ans:
-                    st.success("Correct!")
-                else:
-                    try:
-                        txt = clean_labels[["A", "B", "C", "D"].index(ans)]
-                    except Exception:
-                        txt = ans
-                    st.error(f"Answer: {txt}")
-
-                    old_mistakes = load_data("Mistakes")
-                    new_mistakes = pd.concat([old_mistakes, pd.DataFrame([q])], ignore_index=True)
-                    new_mistakes.drop_duplicates(subset=["question"], keep="last", inplace=True)
-                    save_to_google("Mistakes", new_mistakes)
-                    st.caption("已同步到雲端錯題本")
-
-                st.info(f"解析：{q.get('explanation','')}")
-
-    else:
+    if df.empty:
         st.warning("無題目")
+    else:
+        df["type"] = df["type"].astype(str).replace({"": "choice"})
+        choice_df = df[df["type"].astype(str).str.lower().eq("choice")].copy()
+        choice_df = choice_df[choice_df["option_A"].notna() & (choice_df["option_A"].astype(str).str.strip() != "")]
+
+        if choice_df.empty:
+            st.warning("無可用選擇題（可能解析後都是 essay 題型）")
+        else:
+            if st.button("🎲 抽題"):
+                st.session_state.current_single_q = choice_df.sample(1).iloc[0]
+                st.session_state.single_q_revealed = False
+
+            q = st.session_state.current_single_q
+            if q is not None:
+                st.markdown(f"### {q['question']}")
+                opts = ["A", "B", "C", "D"]
+                opt_labels = [
+                    str(q.get("option_A", "")),
+                    str(q.get("option_B", "")),
+                    str(q.get("option_C", "")),
+                    str(q.get("option_D", "")),
+                ]
+                clean_labels = [l.replace("nan", "").strip() for l in opt_labels]
+
+                user_ans = st.radio(
+                    "選",
+                    opts,
+                    label_visibility="collapsed",
+                    format_func=lambda x: clean_labels[opts.index(x)] if clean_labels[opts.index(x)] else f"{x}（空）",
+                )
+
+                if st.button("看答案"):
+                    st.session_state.single_q_revealed = True
+
+                if st.session_state.single_q_revealed:
+                    ans = extract_answer_key(q.get("correct_answer", ""))
+                    if user_ans == ans:
+                        st.success("Correct!")
+                    else:
+                        try:
+                            txt = clean_labels[["A", "B", "C", "D"].index(ans)]
+                        except Exception:
+                            txt = ans
+                        st.error(f"Answer: {txt}")
+
+                        old_mistakes = load_data("Mistakes")
+                        new_mistakes = pd.concat([old_mistakes, pd.DataFrame([q])], ignore_index=True)
+                        new_mistakes.drop_duplicates(subset=["question"], keep="last", inplace=True)
+                        save_to_google("Mistakes", new_mistakes)
+                        st.caption("已同步到雲端錯題本")
+
+                    st.info(f"解析：{q.get('explanation','')}")
+
 
 # =========================================================
 # 功能 4: PDF 匯入
@@ -563,7 +855,14 @@ elif mode == "📂 匯入 PDF (上傳雲端)":
         data = parse_exam_pdf(text)
         if data:
             new_df = pd.DataFrame(data)
-            st.success(f"解析成功 {len(new_df)} 題")
+
+            # 保證欄位齊
+            for c in EXPECTED_Q_COLS:
+                if c not in new_df.columns:
+                    new_df[c] = ""
+            new_df = new_df[EXPECTED_Q_COLS]
+
+            st.success(f"解析成功 {len(new_df)} 題（含 choice/essay 混合）")
 
             old_df = load_data("Questions")
             final_df = pd.concat([old_df, new_df], ignore_index=True)
@@ -572,13 +871,21 @@ elif mode == "📂 匯入 PDF (上傳雲端)":
             save_to_google("Questions", final_df)
             st.success("✅ 已成功寫入 Google Sheet！")
         else:
-            st.error("❌ 解析不到題目，請確認 PDF 格式是否可被擷取文字（不是掃描圖）。")
+            st.error("❌ 解析不到題目，請確認 PDF 是否可被擷取文字（不是掃描圖）。")
+
 
 # =========================================================
 # Debug
 # =========================================================
 elif mode == "debug 雲端資料檢查":
-    st.write("Questions 表：")
-    st.dataframe(load_data("Questions"))
-    st.write("Mistakes 表：")
-    st.dataframe(load_data("Mistakes"))
+    st.subheader("Questions 表")
+    st.dataframe(load_data("Questions"), use_container_width=True)
+
+    st.subheader("Mistakes 表")
+    st.dataframe(load_data("Mistakes"), use_container_width=True)
+
+    st.subheader("Users 表")
+    st.dataframe(load_users(), use_container_width=True)
+
+    st.subheader("Results 表")
+    st.dataframe(load_results(), use_container_width=True)
