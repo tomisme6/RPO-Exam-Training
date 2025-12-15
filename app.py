@@ -119,61 +119,111 @@ def append_rows(title, df, schema):
 # 輔助函式
 # =====================================================
 def normalize_answer(ans):
-    if pd.isna(ans):
+    """標準化答案：從字串中提取第一個單個數字 (1-4)"""
+    if pd.isna(ans) or ans is None:
         return ""
-    s = re.sub(r"[()（）\s]", "", str(ans))
-    m = re.search(r"[1-4]", s)
-    return m.group(0) if m else ""
+    # 查找並返回字串中第一個非空白的 1, 2, 3, 或 4
+    match = re.search(r"([1-4])", str(ans).strip())
+    return match.group(0) if match else ""
+
+def extract_options_from_line(line, q_obj):
+    """
+    從同一行文字中切割多個選項 (1)... (2)... (3)... (4)...
+    並更新到題目物件 q_obj 中
+    """
+    # 使用 Regex 尋找 (數字) 開頭的位置
+    # pattern: (1)內容 (2)內容...
+    # 我們先用替換方式加上分隔符，再切割
+    temp_line = line
+    # 在 (1), (2), (3), (4) 前面加上特殊分隔符號 |SPLIT|
+    temp_line = re.sub(r"(\([1-4]\))", r"|SPLIT|\1", temp_line)
+    
+    parts = temp_line.split("|SPLIT|")
+    
+    for part in parts:
+        part = part.strip()
+        if not part: continue
+        
+        if part.startswith("(1)"):
+            q_obj["option_A"] = part
+        elif part.startswith("(2)"):
+            q_obj["option_B"] = part
+        elif part.startswith("(3)"):
+            q_obj["option_C"] = part
+        elif part.startswith("(4)"):
+            q_obj["option_D"] = part
 
 def parse_exam_pdf(text):
+    """針對 113年第一次.pdf 格式優化的解析器"""
     questions = []
     lines = text.split("\n")
-    q = None
-
+    
+    current_q = None
+    waiting_for_answer = False # 狀態標記：是否正在等待下一行的答案
+    
     for line in lines:
         line = line.strip()
-        if not line:
+        if not line: continue
+
+        # 0. 過濾頁首頁尾雜訊 (依據文件內容)
+        if "核能安全委員會" in line or "測驗試題" in line or "第" in line and "頁" in line:
             continue
 
-        # 偵測題目開頭 (例如 "1. " 或 "40. ")
-        if re.match(r"^\d+[\.\s]", line):
-            # 如果已經有上一題，先存起來
-            if q:
-                questions.append(q)
-            # 初始化新的一題
-            q = {
-                "question": line,
-                "option_A": "", "option_B": "",
-                "option_C": "", "option_D": "",
-                "correct_answer": "",
-                "explanation": "",
-                "topic": "未分類",
-                "type": "choice"
+        # 1. 處理答案區塊 [解:]
+        if "[解:]" in line:
+            # 情況 A: 答案在同一行，例如 "[解:] (1)"
+            content = line.replace("[解:]", "").strip()
+            if content and current_q:
+                current_q["correct_answer"] = normalize_answer(content)
+                waiting_for_answer = False
+            else:
+                # 情況 B: 答案在下一行 (這是這份文件的常見狀況)
+                waiting_for_answer = True
+            continue
+
+        # 2. 如果正在等待答案 (上一行是 [解:])
+        if waiting_for_answer:
+            if current_q:
+                current_q["correct_answer"] = normalize_answer(line)
+            waiting_for_answer = False # 重置狀態
+            continue
+
+        # 3. 偵測新題目 (數字 + . 或 空白)
+        # 例如: "1. 依天然..." 或 "1 依天然..."
+        match_q = re.match(r"^(\d+)[\.\s](.+)", line)
+        if match_q:
+            # 如果有上一題，先存檔
+            if current_q:
+                questions.append(current_q)
+            
+            # 建立新題目
+            current_q = {
+                "question": line, # 完整題目 (含編號)
+                "option_A": "", "option_B": "", "option_C": "", "option_D": "",
+                "correct_answer": "", "explanation": "",
+                "topic": "未分類", "type": "choice"
             }
             continue
 
-        # 如果 q 還沒建立（代表是PDF檔頭的標題或雜訊），直接跳過，不處理
-        if q is None:
-            continue
+        # 4. 處理選項與題目內容
+        if current_q:
+            # 檢查這一行是否包含選項 (1)~ (4)
+            if re.search(r"\([1-4]\)", line):
+                extract_options_from_line(line, current_q)
+            else:
+                # 如果不是選項，也不是答案，那可能是「題目太長換行」
+                # 將內容接到題目後面 (避免把題目斷掉)
+                # 但要小心不要把解釋或其他雜訊接進去
+                if not current_q["option_A"]: # 如果還沒開始抓選項，才視為題目延伸
+                     current_q["question"] += " " + line
+                else:
+                    # 如果選項都已經抓完了，這行可能是詳解文字 (explanation)
+                    current_q["explanation"] += line + "\n"
 
-        # 偵測選項與解析
-        if line.startswith("(1)"):
-            q["option_A"] = line
-        elif line.startswith("(2)"):
-            q["option_B"] = line
-        elif line.startswith("(3)"):
-            q["option_C"] = line
-        elif line.startswith("(4)"):
-            q["option_D"] = line
-        elif "解" in line:
-            q["correct_answer"] = normalize_answer(line)
-        else:
-            # 只有當 q 存在時，才把文字加到解析或題目敘述中
-            q["explanation"] += line + "\n"
-
-    # 迴圈結束後，把最後一題存進去
-    if q:
-        questions.append(q)
+    # 迴圈結束後，加入最後一題
+    if current_q:
+        questions.append(current_q)
+        
     return questions
 
 # =====================================================
