@@ -10,7 +10,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 st.set_page_config(page_title="質子中心-輻防師特訓平台 (雲端版)", layout="wide", page_icon="☢️")
 
 # --- Google Sheets 設定 ---
-SHEET_NAME = "radiation_exam_db"  # 請確認您的 Google Sheet 檔名
+SHEET_NAME = "Pro_Database"  # 請確認您的 Google Sheet 檔名
 
 # --- 連線函式 (修正版：改讀 Secrets) ---
 @st.cache_resource
