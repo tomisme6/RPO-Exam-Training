@@ -10,53 +10,55 @@ from oauth2client.service_account import ServiceAccountCredentials
 st.set_page_config(page_title="質子中心-輻防師特訓平台 (雲端版)", layout="wide", page_icon="☢️")
 
 # --- Google Sheets 設定 ---
-SHEET_NAME = "Pro_Database"  # 請確認您的 Google Sheet 檔名
+SHEET_NAME = "Pro_Database"  # 已更新為您的正確檔名
 
-# --- 連線函式 (修正版：改讀 Secrets) ---
+# --- 連線函式 ---
 @st.cache_resource
 def init_connection():
     """建立 Google Sheets 連線，改從 Streamlit Secrets 讀取金鑰"""
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     
-    # 檢查 Secrets 是否設定正確
     if "gcp_service_account" not in st.secrets:
         st.error("⚠️ 未偵測到 Secrets 設定！請在 Streamlit Cloud 後台設定 [gcp_service_account]。")
         return None
 
-    # 從 Secrets 讀取字典資料
     creds_dict = st.secrets["gcp_service_account"]
-    
-    # 建立憑證
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     return client
 
-# --- 資料讀寫函式 ---
+# --- 資料讀寫函式 (關鍵修正：防呆檢查) ---
 def load_data(worksheet_name):
-    """從 Google Sheet 讀取資料轉為 DataFrame"""
+    """從 Google Sheet 讀取資料，若分頁已存在則直接讀取，不存在才建立"""
     try:
         client = init_connection()
-        if not client: return pd.DataFrame() # 連線失敗回傳空表
+        if not client: return pd.DataFrame()
 
         sh = client.open(SHEET_NAME)
-        # 檢查工作表是否存在，不存在則建立
-        try:
+        
+        # --- v8.2 修正：先取得所有分頁名稱，避免重複建立 ---
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        
+        if worksheet_name in existing_titles:
+            # 如果分頁已存在，直接打開
             ws = sh.worksheet(worksheet_name)
-        except:
+        else:
+            # 如果不存在，才建立新的
             ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=10)
-            # 初始化標題
             headers = ["question", "option_A", "option_B", "option_C", "option_D", "correct_answer", "explanation", "topic", "type"]
             ws.append_row(headers)
             return pd.DataFrame(columns=headers)
 
+        # 讀取資料
         data = ws.get_all_records()
         df = pd.DataFrame(data)
-        # 確保欄位存在 (防止空表報錯)
+        
         if df.empty:
             return pd.DataFrame(columns=["question", "option_A", "option_B", "option_C", "option_D", "correct_answer", "explanation", "topic", "type"])
         return df
+
     except Exception as e:
-        st.error(f"連線錯誤：找不到試算表 '{SHEET_NAME}' 或 Secrets 設定有誤。\n詳細訊息: {e}")
+        st.error(f"連線錯誤：請確認 Secrets 設定正確且已共用權限給 Service Account。\n錯誤訊息: {e}")
         return pd.DataFrame()
 
 def save_to_google(worksheet_name, new_df):
@@ -64,9 +66,15 @@ def save_to_google(worksheet_name, new_df):
     try:
         client = init_connection()
         sh = client.open(SHEET_NAME)
-        ws = sh.worksheet(worksheet_name)
-        ws.clear() # 清空舊資料
-        # 寫入標題與內容
+        
+        # 同樣加入防呆檢查
+        existing_titles = [ws.title for ws in sh.worksheets()]
+        if worksheet_name not in existing_titles:
+             ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=10)
+        else:
+             ws = sh.worksheet(worksheet_name)
+             
+        ws.clear()
         ws.update([new_df.columns.values.tolist()] + new_df.values.tolist())
     except Exception as e:
         st.error(f"寫入失敗: {e}")
@@ -96,7 +104,7 @@ def extract_answer_key(text):
     return ""
 
 def parse_exam_pdf(text):
-    """v7.0 解析邏輯 (穩定版)"""
+    """v7.0 解析邏輯"""
     questions = []
     lines = text.split('\n')
     current_q = {}
@@ -184,18 +192,17 @@ with st.sidebar:
     ])
     st.markdown("---")
     
-    # 狀態檢查
     if "gcp_service_account" in st.secrets:
         st.success("✅ Secrets 金鑰已偵測")
     else:
-        st.error("⚠️ 未偵測到 Secrets！請至後台設定。")
+        st.error("⚠️ 未偵測到 Secrets！")
 
 # ==========================================
 # 功能 1: 模擬考
 # ==========================================
 if mode == "📝 模擬考模式":
     st.title("📝 雲端題庫模擬考")
-    df = load_data("Questions") # 讀取 "Questions" 工作表
+    df = load_data("Questions")
     
     if not df.empty:
         valid_df = df[ df['question'].notna() & df['correct_answer'].notna() ]
@@ -245,7 +252,6 @@ if mode == "📝 模擬考模式":
                             st.write(f"解析：{row.get('explanation', '')}")
 
                     if wrong_entries:
-                        # 儲存到雲端 Mistakes 工作表
                         wrong_df = pd.DataFrame(wrong_entries)
                         old_mistakes = load_data("Mistakes")
                         final_mistakes = pd.concat([old_mistakes, wrong_df], ignore_index=True)
@@ -292,7 +298,9 @@ elif mode == "📕 錯題本 (雲端同步)":
                     st.success("答對！")
                     with c2:
                         if st.button("🗑️ 從雲端移除"):
-                            new_mistakes = mistake_df[mistake_df['question'] != q['question']]
+                            # 讀取最新，過濾掉該題，再寫回
+                            latest_mistakes = load_data("Mistakes")
+                            new_mistakes = latest_mistakes[latest_mistakes['question'] != q['question']]
                             save_to_google("Mistakes", new_mistakes)
                             st.success("已移除")
                             st.session_state.current_single_q = None
@@ -332,7 +340,6 @@ elif mode == "⚡ 單題即時練習":
                     try: txt = clean_labels[["A","B","C","D"].index(ans)]
                     except: txt = ans
                     st.error(f"Answer: {txt}")
-                    # 存錯題
                     old_mistakes = load_data("Mistakes")
                     new_mistakes = pd.concat([old_mistakes, pd.DataFrame([q])], ignore_index=True)
                     new_mistakes.drop_duplicates(subset=['question'], keep='last', inplace=True)
@@ -356,14 +363,12 @@ elif mode == "📂 匯入 PDF (上傳雲端)":
             new_df = pd.DataFrame(data)
             st.success(f"解析成功 {len(new_df)} 題")
             
-            # 讀取雲端舊資料並合併
             old_df = load_data("Questions")
             final_df = pd.concat([old_df, new_df], ignore_index=True)
             final_df.drop_duplicates(subset=['question'], keep='last', inplace=True)
             
-            # 寫回雲端
             save_to_google("Questions", final_df)
-            st.success("✅ 已成功寫入 Google Sheet！所有組員現在都能看到了。")
+            st.success("✅ 已成功寫入 Google Sheet！")
 
 elif mode == "debug 雲端資料檢查":
     st.write("Questions 表：")
