@@ -1,3 +1,5 @@
 streamlit
 pandas
 pdfplumber
+streamlit-gsheets
+st-gsheets-connection
