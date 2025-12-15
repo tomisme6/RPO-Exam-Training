@@ -80,12 +80,23 @@ if "weak_practice_q" not in st.session_state:
 def get_data(worksheet_name):
     """從 Google Sheet 讀取資料，TTL=0 確保不快取舊資料"""
     try:
+        # 嘗試讀取
         df = conn.read(worksheet=worksheet_name, ttl=0)
+        
+        # 檢查是否為 None 或空 (有時連線成功但沒資料會回傳 None)
+        if df is None:
+            return pd.DataFrame()
+            
         return df
     except Exception as e:
-        st.error(f"讀取資料庫失敗 ({worksheet_name}): {e}")
-        return pd.DataFrame()
-
+        # 只有當錯誤不是 "200" 時才報錯，因為 200 其實是成功的，只是內容可能是空的
+        err_msg = str(e)
+        if "<Response [200]>" in err_msg:
+            # 這是假警報，通常代表表單存在但是是空的，回傳空 DataFrame 即可
+            return pd.DataFrame()
+        else:
+            st.error(f"讀取資料庫失敗 ({worksheet_name}): {e}")
+            return pd.DataFrame()
 def append_data(worksheet_name, new_df):
     """將新資料附加到 Google Sheet"""
     try:
