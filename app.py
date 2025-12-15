@@ -5,7 +5,7 @@ import re
 import os
 
 # --- 設定頁面資訊 ---
-st.set_page_config(page_title="質子中心-輻防師特訓平台 (v5.0)", layout="wide", page_icon="☢️")
+st.set_page_config(page_title="質子中心-輻防師特訓平台 (v6.0)", layout="wide", page_icon="☢️")
 
 # --- 檔案路徑 ---
 csv_file = "data.csv"
@@ -35,7 +35,7 @@ if 'single_q_revealed' not in st.session_state:
 
 # --- 工具函式 ---
 def normalize_answer(ans):
-    """將 (2), 2, (B) 等格式轉為標準 B"""
+    """將 (2), 2, (B) 等格式轉為標準索引 A, B, C, D 以便比對"""
     if pd.isna(ans): return ""
     ans = str(ans).strip().upper()
     ans = ans.replace("(", "").replace(")", "").replace("（", "").replace("）", "")
@@ -57,62 +57,55 @@ def save_mistakes(wrong_rows):
     except Exception as e:
         st.error(f"儲存錯題失敗: {e}")
 
-# ==========================================
-# 核心解析邏輯 (v5.0 強力修復版)
-# ==========================================
 def parse_exam_pdf(text):
+    """解析 PDF 邏輯 (v5.0 穩定版)"""
     questions = []
     lines = text.split('\n')
     current_q = {}
-    
-    # 定義狀態：SEARCH_Q (找題目開頭), READING_Q (讀題目中), READING_OPT (讀選項), READING_EXPL (讀解析)
     state = "SEARCH_Q" 
     
     for line in lines:
         line = line.strip()
         if not line: continue
         
-        # 1. 偵測新題目 (最高優先級：數字+點或空格，如 "3. " 或 "45.")
         if re.match(r'^\d+[\.\s]', line):
-            # 存上一題
-            if current_q:
+            if current_q and 'question' in current_q:
                 if 'correct_answer' not in current_q: current_q['correct_answer'] = ""
                 questions.append(current_q)
-            
-            # 初始化新題目
             current_q = {
                 "question": line, 
                 "option_A": "", "option_B": "", "option_C": "", "option_D": "", 
                 "correct_answer": "", "explanation": "", "type": "choice"
             }
-            state = "READING_Q" # 進入「讀題模式」
+            state = "READING_Q"
             continue
 
-        # 2. 偵測解答標記 [解:]
         if "[解:]" in line or "[解]" in line:
             clean_line = line.replace("[解:]", "").replace("[解]", "").strip()
             if clean_line:
-                # 答案在同一行: [解:] (1)
                 if current_q: current_q['correct_answer'] = normalize_answer(clean_line)
-            # 無論有無答案，接下來都是解析區
-            state = "READING_EXPL" 
+                state = "READING_EXPL"
+            else:
+                state = "WAITING_FOR_ANS" 
             continue
-        
-        # 3. 根據狀態處理文字
+            
         if state == "READING_Q":
-            # --- 關鍵修正：確保多行題目不會斷掉 ---
-            # 只有遇到「明顯的選項開頭」才會切換狀態
-            # 判斷：行首是 (1), (A), 1. 或是 同一行有 (1)和(2)
             if re.match(r'^\(1\)|^\(A\)|^A\.|^1\.', line) or ("(1)" in line and "(2)" in line):
                 state = "READING_OPT"
-                # 不 continue，讓下面的 READING_OPT 邏輯立刻處理這一行
             else:
-                # 否則，這行絕對是題目的一部分！(例如：...表面X公分處...)
                 current_q['question'] += " " + line
                 continue
 
+        if state == "WAITING_FOR_ANS":
+            if current_q:
+                if re.match(r'^\(?\d\)?', line) or re.match(r'^\(?\w\)?', line):
+                     current_q['correct_answer'] = normalize_answer(line)
+                else:
+                     current_q['explanation'] += line
+            state = "READING_EXPL"
+            continue
+
         if state == "READING_OPT":
-            # 處理選項
             if "(1)" in line and "(2)" in line:
                 parts = re.split(r'(?=\(\d\))', line)
                 for part in parts:
@@ -126,22 +119,16 @@ def parse_exam_pdf(text):
             elif line.startswith("(3)"): current_q['option_C'] = line
             elif line.startswith("(4)"): current_q['option_D'] = line
             else:
-                # 如果在讀選項時遇到不認識的行，通常是上一個選項的換行 (例如選項很長)
-                # 這裡簡單處理：如果是 (1)... 後面接文字，通常歸給最後一個選項，或忽略
                 pass
 
         if state == "READING_EXPL":
-            # 讀取解析/答案
-            # 如果還沒抓到答案，且這行長得像 (1) 或 A，就當作答案
             if not current_q['correct_answer'] and re.match(r'^\(?[\d\w]\)?$', line):
                 current_q['correct_answer'] = normalize_answer(line)
             else:
                 current_q['explanation'] += line + "\n"
 
-    # 迴圈結束，存最後一題
     if current_q and 'question' in current_q:
         questions.append(current_q)
-        
     return questions
 
 # --- 主畫面側邊欄 ---
@@ -179,10 +166,9 @@ if mode == "📝 模擬考模式 (自由題數)":
         else:
             if st.session_state.quiz_data is None:
                 st.info(f"目前題庫共有 {len(choice_df)} 題選擇題。")
-                
                 col1, col2 = st.columns([1, 2])
                 with col1:
-                    num = st.number_input("請輸入要測驗的題數", min_value=1, max_value=len(choice_df), value=min(20, len(choice_df)))
+                    num = st.number_input("測驗題數", min_value=1, max_value=len(choice_df), value=min(20, len(choice_df)))
                 with col2:
                     st.write("")
                     st.write("")
@@ -196,13 +182,25 @@ if mode == "📝 模擬考模式 (自由題數)":
                     user_answers = {}
                     for index, row in st.session_state.quiz_data.iterrows():
                         st.markdown(f"**第 {index+1} 題：** {row['question']}")
-                        opts = ["A", "B", "C", "D"]
-                        opt_texts = [str(row.get('option_A','')), str(row.get('option_B','')), str(row.get('option_C','')), str(row.get('option_D',''))]
-                        clean_opts = [o.replace("nan", "") for o in opt_texts]
+                        
+                        # --- 關鍵修正：忠實呈現選項 ---
+                        opts = ["A", "B", "C", "D"] # 這是背後的 key，用來判斷對錯
+                        
+                        # 這是顯示給用戶看的文字，直接讀取 csv 內容，不加料
+                        opt_labels = [
+                            str(row.get('option_A','')), 
+                            str(row.get('option_B','')), 
+                            str(row.get('option_C','')), 
+                            str(row.get('option_D',''))
+                        ]
+                        # 清理 nan
+                        clean_labels = [l.replace("nan", "") for l in opt_labels]
 
+                        # radio 的選項是 A, B, C, D (程式用)，但顯示的是 clean_labels (用戶看)
                         user_answers[index] = st.radio(
-                            f"Q{index+1} 答案", opts, key=f"q_{index}", horizontal=True,
-                            format_func=lambda x: f"{x}. {clean_opts[opts.index(x)]}"
+                            f"Q{index+1} 答案", opts, key=f"q_{index}", 
+                            label_visibility="collapsed",
+                            format_func=lambda x: clean_labels[opts.index(x)] # 顯示原始選項文字
                         )
                         st.markdown("---")
                     
@@ -215,8 +213,8 @@ if mode == "📝 模擬考模式 (自由題數)":
                     wrong_entries = []
 
                     for index, row in st.session_state.quiz_data.iterrows():
-                        user = user_answers.get(index)
-                        ans = normalize_answer(row.get('correct_answer', ''))
+                        user = user_answers.get(index) # 這是 A, B, C, D
+                        ans = normalize_answer(row.get('correct_answer', '')) # 這也是 A, B, C, D
                         
                         if user == ans:
                             score += 1
@@ -224,10 +222,18 @@ if mode == "📝 模擬考模式 (自由題數)":
                             wrong_entries.append(row)
 
                         with st.expander(f"第 {index+1} 題檢討", expanded=(user!=ans)):
+                            # 顯示正確答案時，把代號轉回對應的文字
+                            opt_texts = [str(row.get('option_A')), str(row.get('option_B')), str(row.get('option_C')), str(row.get('option_D'))]
+                            # 防止 index out of range
+                            try:
+                                correct_text = opt_texts[["A","B","C","D"].index(ans)]
+                            except:
+                                correct_text = f"({ans})"
+
                             if user == ans:
-                                st.success(f"答對！答案是 {ans}")
+                                st.success(f"答對！正確答案是：\n{correct_text}")
                             else:
-                                st.error(f"答錯，您的答案 {user}，正確答案是 {ans}")
+                                st.error(f"答錯！正確答案是：\n{correct_text}")
                                 st.caption("❌ 此題已自動加入「錯題本」")
                             st.write(f"解析：{row.get('explanation', '')}")
 
@@ -252,23 +258,24 @@ elif mode == "📕 錯題本 (弱點加強)":
         mistake_df = pd.read_csv(mistakes_file)
         
         if len(mistake_df) == 0:
-            st.success("🎉 太棒了！錯題本目前是空的。")
+            st.success("🎉 錯題本目前是空的。")
         else:
-            st.write(f"目前累積錯誤題數：{len(mistake_df)} 題")
+            st.write(f"累積錯誤題數：{len(mistake_df)} 題")
             
-            if st.button("🎲 從錯題本隨機抽一題練習"):
+            if st.button("🎲 從錯題本抽題"):
                 st.session_state.current_single_q = mistake_df.sample(1).iloc[0]
                 st.session_state.single_q_revealed = False
             
             q = st.session_state.current_single_q
             if q is not None:
                 st.markdown("---")
-                st.markdown(f"### (錯題重練) {q['question']}")
-                opts = ["A", "B", "C", "D"]
-                opt_texts = [str(q.get('option_A','')), str(q.get('option_B','')), str(q.get('option_C','')), str(q.get('option_D',''))]
-                clean_opts = [o.replace("nan", "") for o in opt_texts]
+                st.markdown(f"### {q['question']}")
                 
-                user_ans = st.radio("選擇", opts, format_func=lambda x: f"{x}. {clean_opts[opts.index(x)]}")
+                opts = ["A", "B", "C", "D"]
+                opt_labels = [str(q.get('option_A','')), str(q.get('option_B','')), str(q.get('option_C','')), str(q.get('option_D',''))]
+                clean_labels = [l.replace("nan", "") for l in opt_labels]
+                
+                user_ans = st.radio("選擇", opts, label_visibility="collapsed", format_func=lambda x: clean_labels[opts.index(x)])
                 
                 col1, col2 = st.columns([1, 1])
                 with col1:
@@ -284,18 +291,13 @@ elif mode == "📕 錯題本 (弱點加強)":
                                 current_mistakes = pd.read_csv(mistakes_file)
                                 new_mistakes = current_mistakes[current_mistakes['question'] != q['question']]
                                 new_mistakes.to_csv(mistakes_file, index=False, encoding="utf-8-sig")
-                                st.success("已移除！請重新抽題。")
+                                st.success("已移除！")
                                 st.session_state.current_single_q = None
                                 st.rerun()
                     else:
-                        st.error(f"還是答錯囉... 正確答案是 {ans}")
-                        st.info("加油，多練幾次！")
+                        st.error(f"還是答錯囉... 正確答案是 {clean_labels[['A','B','C','D'].index(ans)]}")
                     
                     st.info(f"解析：{q.get('explanation','')}")
-            
-            st.markdown("---")
-            with st.expander("查看所有錯題列表"):
-                st.dataframe(mistake_df)
     else:
         st.error("錯題本檔案遺失。")
 
@@ -317,10 +319,10 @@ elif mode == "⚡ 單題即時練習":
             if q is not None:
                 st.markdown(f"### {q['question']}")
                 opts = ["A", "B", "C", "D"]
-                opt_texts = [str(q.get('option_A','')), str(q.get('option_B','')), str(q.get('option_C','')), str(q.get('option_D',''))]
-                clean_opts = [o.replace("nan", "") for o in opt_texts]
+                opt_labels = [str(q.get('option_A','')), str(q.get('option_B','')), str(q.get('option_C','')), str(q.get('option_D',''))]
+                clean_labels = [l.replace("nan", "") for l in opt_labels]
                 
-                user_ans = st.radio("選擇", opts, format_func=lambda x: f"{x}. {clean_opts[opts.index(x)]}")
+                user_ans = st.radio("選擇", opts, label_visibility="collapsed", format_func=lambda x: clean_labels[opts.index(x)])
                 
                 if st.button("查看答案"):
                     st.session_state.single_q_revealed = True
@@ -330,7 +332,7 @@ elif mode == "⚡ 單題即時練習":
                     if user_ans == ans:
                         st.success("Correct!")
                     else:
-                        st.error(f"Answer is {ans}")
+                        st.error(f"Answer is {clean_labels[['A','B','C','D'].index(ans)]}")
                         save_mistakes([q])
                         st.caption("已加入錯題本")
                     st.info(f"解析：{q.get('explanation','')}")
@@ -342,7 +344,6 @@ elif mode == "⚡ 單題即時練習":
 # ==========================================
 elif mode == "📂 匯入 PDF 題庫":
     st.title("📂 匯入 PDF")
-    st.info("支援長題目、多行選項與換行答案解析。")
     uploaded_file = st.file_uploader("上傳", type=["pdf"])
     if uploaded_file and st.button("解析"):
         with pdfplumber.open(uploaded_file) as pdf:
