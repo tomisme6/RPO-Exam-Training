@@ -1,5 +1,5 @@
 streamlit
 pandas
 pdfplumber
-gspread==6.1.2
-google-auth==2.34.0
+gspread
+oauth2client
