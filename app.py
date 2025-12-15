@@ -135,9 +135,12 @@ def parse_exam_pdf(text):
         if not line:
             continue
 
+        # 偵測題目開頭 (例如 "1. " 或 "40. ")
         if re.match(r"^\d+[\.\s]", line):
+            # 如果已經有上一題，先存起來
             if q:
                 questions.append(q)
+            # 初始化新的一題
             q = {
                 "question": line,
                 "option_A": "", "option_B": "",
@@ -149,6 +152,11 @@ def parse_exam_pdf(text):
             }
             continue
 
+        # 如果 q 還沒建立（代表是PDF檔頭的標題或雜訊），直接跳過，不處理
+        if q is None:
+            continue
+
+        # 偵測選項與解析
         if line.startswith("(1)"):
             q["option_A"] = line
         elif line.startswith("(2)"):
@@ -160,8 +168,10 @@ def parse_exam_pdf(text):
         elif "解" in line:
             q["correct_answer"] = normalize_answer(line)
         else:
+            # 只有當 q 存在時，才把文字加到解析或題目敘述中
             q["explanation"] += line + "\n"
 
+    # 迴圈結束後，把最後一題存進去
     if q:
         questions.append(q)
     return questions
