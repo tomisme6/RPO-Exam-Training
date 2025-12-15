@@ -10,7 +10,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 st.set_page_config(page_title="質子中心-輻防師特訓平台 (雲端版)", layout="wide", page_icon="☢️")
 
 # --- Google Sheets 設定 ---
-SHEET_NAME = "Pro_Database"  # 已更新為您的正確檔名
+SHEET_NAME = "Pro_Database"  # 請確認這是您的試算表名稱
 
 # --- 連線函式 ---
 @st.cache_resource
@@ -27,29 +27,34 @@ def init_connection():
     client = gspread.authorize(creds)
     return client
 
-# --- 資料讀寫函式 (關鍵修正：防呆檢查) ---
+# --- 關鍵修正：安全取得分頁函式 ---
+def get_or_create_worksheet(sh, name):
+    """
+    嘗試取得分頁，如果不存在就建立。
+    使用 try-except 模式，這是最防止重複建立的方法。
+    """
+    try:
+        # 嘗試直接開啟
+        return sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        # 如果找不到，才建立新的
+        ws = sh.add_worksheet(title=name, rows=1000, cols=10)
+        # 初始化標題
+        headers = ["question", "option_A", "option_B", "option_C", "option_D", "correct_answer", "explanation", "topic", "type"]
+        ws.append_row(headers)
+        return ws
+
+# --- 資料讀寫函式 ---
 def load_data(worksheet_name):
-    """從 Google Sheet 讀取資料，若分頁已存在則直接讀取，不存在才建立"""
+    """從 Google Sheet 讀取資料轉為 DataFrame"""
     try:
         client = init_connection()
         if not client: return pd.DataFrame()
 
         sh = client.open(SHEET_NAME)
-        
-        # --- v8.2 修正：先取得所有分頁名稱，避免重複建立 ---
-        existing_titles = [ws.title for ws in sh.worksheets()]
-        
-        if worksheet_name in existing_titles:
-            # 如果分頁已存在，直接打開
-            ws = sh.worksheet(worksheet_name)
-        else:
-            # 如果不存在，才建立新的
-            ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=10)
-            headers = ["question", "option_A", "option_B", "option_C", "option_D", "correct_answer", "explanation", "topic", "type"]
-            ws.append_row(headers)
-            return pd.DataFrame(columns=headers)
+        # 使用新函式安全取得分頁
+        ws = get_or_create_worksheet(sh, worksheet_name)
 
-        # 讀取資料
         data = ws.get_all_records()
         df = pd.DataFrame(data)
         
@@ -58,7 +63,7 @@ def load_data(worksheet_name):
         return df
 
     except Exception as e:
-        st.error(f"連線錯誤：請確認 Secrets 設定正確且已共用權限給 Service Account。\n錯誤訊息: {e}")
+        st.error(f"連線錯誤：請確認 Secrets 設定正確且已共用權限給 Service Account。\n詳細錯誤: {e}")
         return pd.DataFrame()
 
 def save_to_google(worksheet_name, new_df):
@@ -66,15 +71,11 @@ def save_to_google(worksheet_name, new_df):
     try:
         client = init_connection()
         sh = client.open(SHEET_NAME)
-        
-        # 同樣加入防呆檢查
-        existing_titles = [ws.title for ws in sh.worksheets()]
-        if worksheet_name not in existing_titles:
-             ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=10)
-        else:
-             ws = sh.worksheet(worksheet_name)
+        # 使用新函式安全取得分頁
+        ws = get_or_create_worksheet(sh, worksheet_name)
              
         ws.clear()
+        # 寫入標題與內容
         ws.update([new_df.columns.values.tolist()] + new_df.values.tolist())
     except Exception as e:
         st.error(f"寫入失敗: {e}")
@@ -298,7 +299,6 @@ elif mode == "📕 錯題本 (雲端同步)":
                     st.success("答對！")
                     with c2:
                         if st.button("🗑️ 從雲端移除"):
-                            # 讀取最新，過濾掉該題，再寫回
                             latest_mistakes = load_data("Mistakes")
                             new_mistakes = latest_mistakes[latest_mistakes['question'] != q['question']]
                             save_to_google("Mistakes", new_mistakes)
