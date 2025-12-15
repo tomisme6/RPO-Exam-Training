@@ -16,6 +16,10 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 
 SHEET_NAME = "Pro_Database"  # Google Sheet 檔名（不是分頁名）
 
+# 介面語句（可自訂）
+MSG_CORRECT = "還可以嘛！👌"
+MSG_WRONG = "到底行不行啊！😤"
+
 EXPECTED_Q_COLS = [
     "question", "option_A", "option_B", "option_C", "option_D",
     "correct_answer", "explanation", "topic", "type"
@@ -415,7 +419,7 @@ if "user" not in st.session_state:
 # Sidebar：登入/註冊 + 模式
 # =========================================================
 with st.sidebar:
-    st.title("☁️ 雲端功能選單")
+    st.title("🔋 強強輻防師充電站｜功能選單")
 
     # 未登入：登入/註冊
     if st.session_state.user is None:
@@ -519,16 +523,13 @@ if mode == "📊 管理者後台（成績）":
         st.info("目前沒有任何測驗紀錄")
         st.stop()
 
-    # 基本清理
     res["percent_num"] = pd.to_numeric(res["percent"], errors="coerce")
-    res["score_num"] = pd.to_numeric(res["score"], errors="coerce")
-    res["total_num"] = pd.to_numeric(res["total"], errors="coerce")
 
     users = sorted([u for u in res["username"].astype(str).unique() if u.strip() != ""])
     pick = st.multiselect("篩選使用者", users, default=users)
 
     view = res[res["username"].astype(str).isin(pick)].copy()
-    st.dataframe(view.drop(columns=["percent_num", "score_num", "total_num"], errors="ignore"), use_container_width=True)
+    st.dataframe(view.drop(columns=["percent_num"], errors="ignore"), use_container_width=True)
 
     st.subheader("📌 使用者平均分數（%）")
     agg = (
@@ -600,16 +601,21 @@ if mode == "📝 模擬考模式":
         valid_df = df[df["question"].notna() & (df["question"].astype(str).str.strip() != "")]
         choice_df = valid_df[valid_df["type"].astype(str).str.lower().eq("choice")].copy()
 
-        # 選項至少三個不空
         def opt_count(r):
-            opts = [str(r.get("option_A","")).strip(), str(r.get("option_B","")).strip(),
-                    str(r.get("option_C","")).strip(), str(r.get("option_D","")).strip()]
+            opts = [
+                str(r.get("option_A", "")).strip(),
+                str(r.get("option_B", "")).strip(),
+                str(r.get("option_C", "")).strip(),
+                str(r.get("option_D", "")).strip(),
+            ]
             return sum(1 for o in opts if o and o.lower() != "nan")
 
         if not choice_df.empty:
             choice_df["opt_cnt"] = choice_df.apply(opt_count, axis=1)
-            choice_df = choice_df[(choice_df["opt_cnt"] >= 3) & (choice_df["correct_answer"].astype(str).str.strip() != "")]
-            choice_df.drop(columns=["opt_cnt"], inplace=True, errors="ignore")
+            choice_df = choice_df[
+                (choice_df["opt_cnt"] >= 3)
+                & (choice_df["correct_answer"].astype(str).str.strip() != "")
+            ].drop(columns=["opt_cnt"], errors="ignore")
 
         if len(choice_df) == 0:
             st.warning("雲端題庫沒有可用的選擇題（請先匯入 PDF 或檢查解析結果）。")
@@ -674,9 +680,9 @@ if mode == "📝 模擬考模式":
                                 correct_text = ans
 
                             if user == ans:
-                                st.success(f"答對！{correct_text}")
+                                st.success(f"{MSG_CORRECT} {correct_text}")
                             else:
-                                st.error(f"答錯！正確：{correct_text}")
+                                st.error(f"{MSG_WRONG} 正確是：{correct_text}")
                             st.write(f"解析：{row.get('explanation', '')}")
 
                     # 同步錯題
@@ -720,7 +726,6 @@ elif mode == "📕 錯題本 (雲端同步)":
     if mistake_df.empty:
         st.success("☁️ 雲端錯題本是空的！")
     else:
-        # 只練 choice 題
         mistake_df["type"] = mistake_df["type"].astype(str).replace({"": "choice"})
         mistake_df = mistake_df[mistake_df["type"].astype(str).str.lower().eq("choice")]
 
@@ -756,7 +761,7 @@ elif mode == "📕 錯題本 (雲端同步)":
             if st.session_state.single_q_revealed:
                 ans = extract_answer_key(q.get("correct_answer", ""))
                 if user_ans == ans:
-                    st.success("答對！")
+                    st.success(MSG_CORRECT)
                     with c2:
                         if st.button("🗑️ 從雲端移除"):
                             latest_mistakes = load_data("Mistakes")
@@ -770,7 +775,7 @@ elif mode == "📕 錯題本 (雲端同步)":
                         txt = clean_labels[["A", "B", "C", "D"].index(ans)]
                     except Exception:
                         txt = ans
-                    st.error(f"答錯，正確是：{txt}")
+                    st.error(f"{MSG_WRONG} 正確是：{txt}")
 
                 st.info(f"解析：{q.get('explanation','')}")
 
@@ -820,13 +825,13 @@ elif mode == "⚡ 單題即時練習":
                 if st.session_state.single_q_revealed:
                     ans = extract_answer_key(q.get("correct_answer", ""))
                     if user_ans == ans:
-                        st.success("Correct!")
+                        st.success(MSG_CORRECT)
                     else:
                         try:
                             txt = clean_labels[["A", "B", "C", "D"].index(ans)]
                         except Exception:
                             txt = ans
-                        st.error(f"Answer: {txt}")
+                        st.error(f"{MSG_WRONG} 正確是：{txt}")
 
                         old_mistakes = load_data("Mistakes")
                         new_mistakes = pd.concat([old_mistakes, pd.DataFrame([q])], ignore_index=True)
@@ -856,7 +861,6 @@ elif mode == "📂 匯入 PDF (上傳雲端)":
         if data:
             new_df = pd.DataFrame(data)
 
-            # 保證欄位齊
             for c in EXPECTED_Q_COLS:
                 if c not in new_df.columns:
                     new_df[c] = ""
