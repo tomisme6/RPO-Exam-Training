@@ -78,35 +78,42 @@ if "weak_practice_q" not in st.session_state:
 # ==========================
 
 def get_data(worksheet_name):
-    """從 Google Sheet 讀取資料，TTL=0 確保不快取舊資料"""
+    """從 Google Sheet 讀取資料，忽略 200 假警報"""
     try:
-        # 嘗試讀取
         df = conn.read(worksheet=worksheet_name, ttl=0)
-        
-        # 檢查是否為 None 或空 (有時連線成功但沒資料會回傳 None)
+        # 如果讀出來是 None，回傳空 DataFrame
         if df is None:
             return pd.DataFrame()
-            
         return df
     except Exception as e:
-        # 只有當錯誤不是 "200" 時才報錯，因為 200 其實是成功的，只是內容可能是空的
-        err_msg = str(e)
-        if "<Response [200]>" in err_msg:
-            # 這是假警報，通常代表表單存在但是是空的，回傳空 DataFrame 即可
+        # 如果錯誤訊息包含 200，代表其實是成功的 (空表狀況)
+        if "<Response [200]>" in str(e):
             return pd.DataFrame()
-        else:
-            st.error(f"讀取資料庫失敗 ({worksheet_name}): {e}")
-            return pd.DataFrame()
+        
+        st.error(f"讀取資料庫失敗 ({worksheet_name}): {e}")
+        return pd.DataFrame()
+
 def append_data(worksheet_name, new_df):
-    """將新資料附加到 Google Sheet"""
+    """將新資料附加到 Google Sheet，忽略 200 假警報"""
     try:
-        # 先讀取舊資料
+        # 1. 先讀舊資料
         old_df = get_data(worksheet_name)
-        # 合併
-        updated_df = pd.concat([old_df, new_df], ignore_index=True)
-        # 寫回 (update 模式)
+        
+        # 2. 合併資料 (確保欄位對齊)
+        if old_df.empty:
+            updated_df = new_df
+        else:
+            # 確保不會因為空欄位導致 concat 失敗
+            updated_df = pd.concat([old_df, new_df], ignore_index=True)
+            
+        # 3. 寫入資料
         conn.update(worksheet=worksheet_name, data=updated_df)
+        
     except Exception as e:
+        # 這裡是最關鍵的修正：如果是 200 錯誤，視為成功
+        if "<Response [200]>" in str(e):
+            return  # 默默成功，不顯示錯誤
+            
         st.error(f"寫入資料庫失敗 ({worksheet_name}): {e}")
 
 def normalize_answer(ans):
