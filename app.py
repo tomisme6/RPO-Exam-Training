@@ -175,32 +175,51 @@ def extract_answer_key(text):
 
 def parse_exam_pdf(text):
     """
-    v7.1 修正版：
-    1) 正確辨識 [解:] / [解：] / [解]
-    2) 避免把答案行 (3) 當成選項覆蓋 option_C
-    3) 支援選項跨行：例如一行只有 "(3)"，下一行才是文字
-    4) 忽略頁碼 footer：第X頁/共Y頁
+    v7.2 修正版：
+    - 支援 [解:] / [解：] / [解]
+    - 選項行不再只吃行首，改成「一行內所有 (1)(2)(3)(4) 全部拆開」
+    - 選項跨行：若上一行是選項，下一行沒有新 (n) 記號就接到上一個選項後面
+    - 忽略頁尾：第X頁/共Y頁
     """
     questions = []
     lines = text.split("\n")
 
     current_q = None
     state = "SEARCH_Q"
-    last_opt = None  # 記錄上一個選項欄位，讓跨行文字能接上去
+    last_opt = None  # option_A/B/C/D
 
-    def is_footer(line: str) -> bool:
-        return bool(re.match(r"^第\s*\d+\s*頁/共\s*\d+\s*頁", line))
+    def is_footer(s: str) -> bool:
+        return bool(re.match(r"^第\s*\d+\s*頁/共\s*\d+\s*頁", s.strip()))
 
-    def is_answer_marker(line: str) -> bool:
-        # 同時吃半形/全形冒號：[解:]、[解：]、[解]
-        return bool(re.search(r"\[解(?:[:：])?\]", line))
+    def is_answer_marker(s: str) -> bool:
+        return bool(re.search(r"\[解(?:[:：])?\]", s))
+
+    def split_options_anywhere(s: str):
+        """
+        把一行內所有選項拆開：
+        支援 (1) 或 （1）
+        回傳 dict: {"1": "(1)....", "2": "(2)....", ...}
+        """
+        pat = r"[（(]([1-4])[）)]"
+        hits = list(re.finditer(pat, s))
+        if not hits:
+            return {}
+
+        out = {}
+        for i, m in enumerate(hits):
+            n = m.group(1)
+            start = m.start()
+            end = hits[i + 1].start() if i + 1 < len(hits) else len(s)
+            chunk = s[start:end].strip()
+            out[n] = chunk
+        return out
 
     for raw in lines:
         line = raw.strip()
         if not line or is_footer(line):
             continue
 
-        # 新題目（例如：5. xxx）
+        # 新題目
         if re.match(r"^\d+[\.\s]", line):
             if current_q and "question" in current_q:
                 questions.append(current_q)
@@ -225,9 +244,7 @@ def parse_exam_pdf(text):
 
         # 解答標記
         if is_answer_marker(line):
-            # 這行可能是 "" 這種黏在一起，也可能只有 "[解：]"
             after = re.sub(r".*\[解(?:[:：])?\]\s*", "", line).strip()
-
             if after:
                 ans = extract_answer_key(after)
                 if ans:
@@ -239,7 +256,7 @@ def parse_exam_pdf(text):
             last_opt = None
             continue
 
-        # 等待答案那一行（通常是 "(3)"）
+        # 等待答案那一行（通常是 (3)）
         if state == "WAITING_FOR_ANS":
             ans = extract_answer_key(line)
             if ans and not current_q.get("correct_answer"):
@@ -250,63 +267,38 @@ def parse_exam_pdf(text):
 
         # 讀題幹（直到遇到選項）
         if state == "READING_Q":
-            if re.match(r"^\(\d\)", line) or ("(1)" in line and "(2)" in line):
+            # 只要一行出現任何 (1)-(4)，就視為進入選項
+            if split_options_anywhere(line):
                 state = "READING_OPT"
             else:
                 current_q["question"] += " " + line
                 continue
 
-        # 讀選項
+        # 讀選項（核心修正：不管記號在不在行首，都拆）
         if state == "READING_OPT":
-            # 一行包含多個選項：(1)...(2)...(3)...(4)...
-            if "(1)" in line and "(2)" in line:
-                parts = re.split(r"(?=\(\d\))", line)
-                for part in parts:
-                    part = part.strip()
-                    m = re.match(r"^\((\d)\)\s*(.*)$", part)
-                    if not m:
-                        continue
-                    n, content = m.group(1), m.group(2).strip()
-                    if n == "1":
-                        current_q["option_A"] = f"(1){content}" if content else "(1)"
-                        last_opt = "option_A"
-                    elif n == "2":
-                        current_q["option_B"] = f"(2){content}" if content else "(2)"
-                        last_opt = "option_B"
-                    elif n == "3":
-                        current_q["option_C"] = f"(3){content}" if content else "(3)"
-                        last_opt = "option_C"
-                    elif n == "4":
-                        current_q["option_D"] = f"(4){content}" if content else "(4)"
-                        last_opt = "option_D"
-                continue
-
-            # 單一選項行
-            m = re.match(r"^\((\d)\)\s*(.*)$", line)
-            if m:
-                n, content = m.group(1), m.group(2).strip()
-                if n == "1":
-                    current_q["option_A"] = line
+            opts = split_options_anywhere(line)
+            if opts:
+                if "1" in opts:
+                    current_q["option_A"] = opts["1"]
                     last_opt = "option_A"
-                elif n == "2":
-                    current_q["option_B"] = line
+                if "2" in opts:
+                    current_q["option_B"] = opts["2"]
                     last_opt = "option_B"
-                elif n == "3":
-                    current_q["option_C"] = line
+                if "3" in opts:
+                    current_q["option_C"] = opts["3"]
                     last_opt = "option_C"
-                elif n == "4":
-                    current_q["option_D"] = line
+                if "4" in opts:
+                    current_q["option_D"] = opts["4"]
                     last_opt = "option_D"
                 continue
 
-            # 選項跨行補字：如果上一行只有 "(3)"，下一行把文字接上去
-            if last_opt and not is_answer_marker(line):
+            # 沒有新選項記號 → 當作上一個選項的續行
+            if last_opt:
                 current_q[last_opt] = (current_q[last_opt] + " " + line).strip()
                 continue
 
         # 讀解析
         if state == "READING_EXPL":
-            # 若解析段落第一行就是答案，也補抓
             if not current_q.get("correct_answer"):
                 ans = extract_answer_key(line)
                 if ans:
